@@ -8,7 +8,7 @@ import (
 	"log"
 	"net"
 	"smtp-server/db"
-	ratelimit "smtp-server/rate-limit"
+	"smtp-server/middleware"
 	"strconv"
 	"strings"
 	"time"
@@ -20,7 +20,8 @@ import (
 
 var (
 	IDGen *sonyflake.Sonyflake
-	rl    *ratelimit.RateLimiter
+	rl    *middleware.RateLimiter
+	auth  *middleware.Auth
 )
 
 const startEpcohInMili = 1767225600000
@@ -55,6 +56,9 @@ func main() {
 		StartTime: time.UnixMilli(startEpcohInMili),
 	})
 
+	rl = middleware.NewRateLimit(rdb, 20, 5, 5*time.Minute)
+	auth = middleware.SetupAuth(rdb, 5, 10*time.Second)
+
 	lis, err := net.Listen("tcp", ":8000")
 	if err != nil {
 		log.Fatal(err)
@@ -77,8 +81,7 @@ func handelConnection(conn net.Conn, rdb *redis.Client) {
 	defer conn.Close()
 
 	session := &SMTPSession{
-		conn:  conn,
-		state: StateInit,
+		conn: conn,
 	}
 
 	reader := bufio.NewReader(conn)
@@ -100,13 +103,15 @@ func handelConnection(conn net.Conn, rdb *redis.Client) {
 
 		switch {
 		case strings.HasPrefix(line, "AUTH LOGIN"):
+			ip := conn.RemoteAddr().String()
+
 			writer.WriteString("334 VXNlcm5hbWU6\r\n")
 			writer.Flush()
 
 			userLine, _ := reader.ReadString('\n')
 			userNameBytes, _ := base64.StdEncoding.DecodeString(strings.TrimSpace(userLine))
 			username := string(userNameBytes)
-			if !rl.Validate(username) {
+			if !rl.Validate(username, net.IP(ip)) {
 				writer.WriteString("454 Too many login attempts\r\n")
 				writer.Flush()
 				continue
@@ -123,6 +128,7 @@ func handelConnection(conn net.Conn, rdb *redis.Client) {
 			).Result()
 
 			if err == redis.Nil {
+				auth.IncreaseFalis(username)
 				writer.WriteString("535 Authentication failed\r\n")
 				writer.Flush()
 				continue
@@ -138,9 +144,12 @@ func handelConnection(conn net.Conn, rdb *redis.Client) {
 				[]byte(password),
 			)
 			if err != nil {
+				auth.IncreaseFalis(username)
 				writer.WriteString("535 Authentication failed\r\n")
 			} else {
 				session.authenticated = true
+				session.state = StateInit
+				rdb.Del(context.Background(), fmt.Sprintf("auth:fail:user:%s", username))
 				writer.WriteString("235 Authentication successful\r\n")
 			}
 			writer.Flush()
