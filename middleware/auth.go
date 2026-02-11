@@ -22,7 +22,7 @@ func SetupAuth(rdb *redis.Client, l int, d time.Duration) *Auth {
 	}
 }
 
-func (a *Auth) IncreaseFalis(username string) {
+func (a *Auth) IncreaseFails(username string) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(3*time.Second))
 	defer cancel()
 

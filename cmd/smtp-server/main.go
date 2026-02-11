@@ -4,12 +4,13 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"smtp-server/db"
 	"smtp-server/middleware"
-	"strconv"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,12 +20,16 @@ import (
 )
 
 var (
-	IDGen *sonyflake.Sonyflake
-	rl    *middleware.RateLimiter
-	auth  *middleware.Auth
+	IDGen        *sonyflake.Sonyflake
+	rl           *middleware.RateLimiter
+	auth         *middleware.Auth
+	LocalDomains = map[string]bool{
+		"myserver.local": true, // placeholder
+	}
+	rdb *redis.Client
 )
 
-const startEpcohInMili = 1767225600000
+const startEpochInMilli = 1767225600000
 
 type SessionState int
 
@@ -47,14 +52,18 @@ type SMTPSession struct {
 }
 
 func main() {
-	rdb, err := db.ConnectRedis()
+	var err error
+	rdb, err = db.ConnectRedis()
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	IDGen, err = sonyflake.New(sonyflake.Settings{
-		StartTime: time.UnixMilli(startEpcohInMili),
+		StartTime: time.UnixMilli(startEpochInMilli),
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	rl = middleware.NewRateLimit(rdb, 20, 5, 5*time.Minute)
 	auth = middleware.SetupAuth(rdb, 5, 10*time.Second)
@@ -65,7 +74,9 @@ func main() {
 	}
 	defer lis.Close()
 
-	log.Println("litsing on port 8080")
+	log.Println("listening on port 8000")
+
+	go SaveMailWorker()
 
 	for {
 		conn, err := lis.Accept()
@@ -73,11 +84,11 @@ func main() {
 			log.Println(err)
 			continue
 		}
-		go handelConnection(conn, rdb)
+		go handleConnection(conn)
 	}
 }
 
-func handelConnection(conn net.Conn, rdb *redis.Client) {
+func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	session := &SMTPSession{
@@ -87,8 +98,7 @@ func handelConnection(conn net.Conn, rdb *redis.Client) {
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
-	writer.WriteString("220 SimpleSMTP ready\r\n")
-	writer.Flush()
+	writeAndFlush(writer, "220 SimpleSMTP ready\r\n")
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -103,21 +113,28 @@ func handelConnection(conn net.Conn, rdb *redis.Client) {
 
 		switch {
 		case strings.HasPrefix(line, "AUTH LOGIN"):
-			ip := conn.RemoteAddr().String()
+			host, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+			ip := net.ParseIP(host)
 
-			writer.WriteString("334 VXNlcm5hbWU6\r\n")
-			writer.Flush()
+			writeAndFlush(writer, "334 VXNlcm5hbWU6\r\n")
 
 			userLine, _ := reader.ReadString('\n')
 			userNameBytes, _ := base64.StdEncoding.DecodeString(strings.TrimSpace(userLine))
 			username := string(userNameBytes)
+
 			if !rl.Validate(username, net.IP(ip)) {
-				writer.WriteString("454 Too many login attempts\r\n")
-				writer.Flush()
+				writeAndFlush(writer, "454 Too many login attempts\r\n")
+				continue
+			}
+			if auth.CheckLock(username) {
+				writeAndFlush(writer, "535 Account temporarily locked\r\n")
 				continue
 			}
 
+			writeAndFlush(writer, "334 UGFzc3dvcmQ6\r\n")
+
 			passLine, _ := reader.ReadString('\n')
+
 			passwordBytes, _ := base64.StdEncoding.DecodeString(strings.TrimSpace(passLine))
 			password := string(passwordBytes)
 
@@ -128,14 +145,12 @@ func handelConnection(conn net.Conn, rdb *redis.Client) {
 			).Result()
 
 			if err == redis.Nil {
-				auth.IncreaseFalis(username)
-				writer.WriteString("535 Authentication failed\r\n")
-				writer.Flush()
+				auth.IncreaseFails(username)
+				writeAndFlush(writer, "535 Authentication failed\r\n")
 				continue
 			}
 			if err != nil {
-				writer.WriteString("451 Local error\r\n")
-				writer.Flush()
+				writeAndFlush(writer, "451 Local error\r\n")
 				continue
 			}
 
@@ -144,22 +159,22 @@ func handelConnection(conn net.Conn, rdb *redis.Client) {
 				[]byte(password),
 			)
 			if err != nil {
-				auth.IncreaseFalis(username)
-				writer.WriteString("535 Authentication failed\r\n")
+				auth.IncreaseFails(username)
+				writeAndFlush(writer, "535 Authentication failed\r\n")
 			} else {
 				session.authenticated = true
 				session.state = StateInit
+				session.userName = username
 				rdb.Del(context.Background(), fmt.Sprintf("auth:fail:user:%s", username))
-				writer.WriteString("235 Authentication successful\r\n")
+				writeAndFlush(writer, "235 Authentication successful\r\n")
 			}
-			writer.Flush()
 
 		case strings.HasPrefix(line, "HELO"):
 			if !session.validateSession(StateInit, writer) {
 				continue
 			}
 			session.state = StateHelo
-			writer.WriteString("250 Hello\r\n")
+			writeAndFlush(writer, "250 Hello\r\n")
 
 		case strings.HasPrefix(line, "MAIL FROM:"):
 			if !session.validateSession(StateHelo, writer) {
@@ -172,24 +187,23 @@ func handelConnection(conn net.Conn, rdb *redis.Client) {
 				"email",
 			).Result()
 			if err == redis.Nil || session.userName == "" {
-				writer.WriteString("535 Authentication failed\r\n")
-				writer.Flush()
+				writeAndFlush(writer, "535 Authentication failed\r\n")
 				continue
 			}
 			if err != nil {
-				writer.WriteString("451 Local error\r\n")
-				writer.Flush()
+				writeAndFlush(writer, "451 Local error\r\n")
 				continue
 			}
-			if dbUserEmail != line {
-				writer.WriteString("535 Authentication failed\r\n")
-				writer.Flush()
+			addr := strings.TrimSpace(line[len("MAIL FROM:"):])
+			addr = strings.Trim(addr, "<>")
+			if dbUserEmail != addr {
+				writeAndFlush(writer, "535 Authentication failed\r\n")
 				continue
 			}
 
 			session.state = StateMail
 			session.mailFrom = line
-			writer.WriteString("250 OK\r\n")
+			writeAndFlush(writer, "250 OK\r\n")
 
 		case strings.HasPrefix(line, "RCPT TO:"):
 			if !session.validateSession(StateMail, writer) {
@@ -197,7 +211,7 @@ func handelConnection(conn net.Conn, rdb *redis.Client) {
 			}
 			session.state = StateRcpt
 			session.rcpt = line
-			writer.WriteString("250 OK\r\n")
+			writeAndFlush(writer, "250 OK\r\n")
 
 		case line == "DATA":
 			if !session.validateSession(StateRcpt, writer) {
@@ -205,8 +219,7 @@ func handelConnection(conn net.Conn, rdb *redis.Client) {
 			}
 			session.state = StateData
 
-			writer.WriteString("354 End data with <CR><LF>.<CR><LF>\r\n")
-			writer.Flush()
+			writeAndFlush(writer, "354 End data with <CR><LF>.<CR><LF>\r\n")
 
 			var body strings.Builder
 			for {
@@ -227,61 +240,59 @@ func handelConnection(conn net.Conn, rdb *redis.Client) {
 			id, err := IDGen.NextID()
 			if err != nil {
 				log.Println(err)
-				writer.WriteString("451 Local error in processing\r\n")
-				writer.Flush()
+				writeAndFlush(writer, "451 Local error in processing\r\n")
 				continue
 			}
 
-			err = rdb.HSet(
-				context.Background(),
-				"mail:"+strconv.Itoa(int(id)),
-				map[string]any{
-					"from": session.mailFrom,
-					"to":   session.rcpt,
-					"data": session.data,
-				},
-			).Err()
+			msg := map[string]any{
+				"id":       id,
+				"username": session.userName,
+				"from":     session.mailFrom,
+				"to":       session.rcpt,
+				"data":     session.data,
+				"time":     time.Now().Unix(),
+				"retry":    0,
+			}
+
+			msgJSON, err := json.Marshal(msg)
 			if err != nil {
-				log.Panicln(err)
-				writer.WriteString("451 Local error in processing\r\n")
-				writer.Flush()
+				writeAndFlush(writer, "451 Local error in processing\r\n")
 				continue
 			}
 
-			writer.WriteString("250 Message accepted\r\n")
-			writer.Flush()
+			err = rdb.LPush(context.Background(), "mail_queue", msgJSON).Err()
+			if err != nil {
+				writeAndFlush(writer, "451 Queue error\r\n")
+				continue
+			}
+
+			writeAndFlush(writer, "250 Message accepted\r\n")
 
 			session.Reset()
 
 		case line == "RSET":
 			session.Reset()
-			writer.WriteString("250 OK\r\n")
-			writer.Flush()
+			writeAndFlush(writer, "250 OK\r\n")
 			continue
 
 		case line == "QUIT":
-			writer.WriteString("221 Bye\r\n")
-			writer.Flush()
+			writeAndFlush(writer, "221 Bye\r\n")
 			return
 
 		default:
-			writer.WriteString("250 OK\r\n")
+			writeAndFlush(writer, "500 Syntax error, command unrecognized\r\n")
 		}
-
-		writer.Flush()
 	}
 }
 
 func (s *SMTPSession) validateSession(valid SessionState, w *bufio.Writer) bool {
 	if !s.authenticated {
-		w.WriteString("530 Authentication required\r\n")
-		w.Flush()
+		writeAndFlush(w, "530 Authentication required\r\n")
 		return false
 	}
 
 	if s.state != valid {
-		w.WriteString("503 Bad sequence of commands\r\n")
-		w.Flush()
+		writeAndFlush(w, "503 Bad sequence of commands\r\n")
 		return false
 	}
 
@@ -293,4 +304,128 @@ func (s *SMTPSession) Reset() {
 	s.rcpt = ""
 	s.data = ""
 	s.state = StateHelo
+}
+
+func getDomain(email string) string {
+	parts := strings.Split(email, "@")
+	if len(parts) != 2 {
+		return ""
+	}
+
+	return parts[1]
+}
+
+func lookupMX(domain string) (string, error) {
+	mxRecords, err := net.LookupMX(domain)
+	if err != nil {
+		return "", err
+	}
+
+	sort.Slice(mxRecords, func(i, j int) bool {
+		return mxRecords[i].Pref < mxRecords[j].Pref
+	})
+
+	return strings.TrimSuffix(mxRecords[0].Host, "."), nil
+}
+
+func SaveMailWorker() {
+	for {
+		res, err := rdb.BRPop(context.Background(), 0, "mail_queue").Result()
+		if err != nil {
+			log.Println("Error fetching from queue:", err)
+			continue
+		}
+
+		var msg map[string]any
+		err = json.Unmarshal([]byte(res[1]), &msg)
+		if err != nil {
+			log.Println("Error unmarshaling message:", err)
+			continue
+		}
+
+		to := msg["to"].(string)
+		domain := getDomain(to)
+
+		if LocalDomains[domain] {
+			err := rdb.HSet(
+				context.Background(),
+				fmt.Sprintf("mailbox:%s:%s", msg["username"], msg["id"]),
+				msg,
+			).Err()
+			if err != nil {
+				go AddToRetry(msg, err, 3)
+				continue
+			}
+		} else {
+			mxHost, err := lookupMX(domain)
+			if err != nil {
+				go AddToRetry(msg, err, 2)
+				continue
+			}
+
+			log.Println("Message saved successfully:", msg["id"])
+			err = SendSMTP(mxHost+":25", msg["from"].(string), msg["to"].(string), msg["data"].(string))
+			if err != nil {
+				go AddToRetry(msg, err, 3)
+				continue
+			}
+		}
+
+		err = rdb.HSet(
+			context.Background(),
+			"mail:"+fmt.Sprint(msg["id"]),
+			map[string]any{
+				"from":     msg["from"],
+				"to":       msg["to"],
+				"username": msg["username"],
+				"data":     msg["data"],
+				"time":     time.Now().Unix(),
+				"retry":    msg["retry"],
+			},
+		).Err()
+		if err != nil {
+			go AddToRetry(msg, err, 1)
+		}
+	}
+}
+
+func AddToRetry(msg map[string]any, err error, nextAttempt int) {
+	msg["error"] = err.Error()
+	tries := 0
+	if r, ok := msg["retry"].(float64); ok {
+		tries = int(r)
+	}
+	tries++
+	if tries > 5 {
+		log.Printf("Droping mail. Last error: %s", err.Error())
+		msgJSON, _ := json.Marshal(msg)
+		rdb.RPush(context.Background(), "failed_mail_queue", msgJSON)
+		return
+	}
+	msg["retry"] = tries
+	msgJSON, _ := json.Marshal(msg)
+	rdb.ZAdd(context.Background(), "mail_retry_queue", redis.Z{
+		Score:  float64(nextAttempt),
+		Member: msgJSON,
+	})
+	log.Println("Retrying message save:", err)
+}
+
+func schedulerWorker() {
+	now := time.Now().Unix()
+
+	msgs, _ := rdb.ZRangeByScore(context.Background(), "mail_retry_queue", &redis.ZRangeBy{
+		Min: "0",
+		Max: fmt.Sprint(now),
+	}).Result()
+
+	for _, m := range msgs {
+		rdb.LPush(context.Background(), "mail_queue", m)
+		rdb.ZRem(context.Background(), "mail_retry_queue", m)
+	}
+}
+
+func writeAndFlush(w *bufio.Writer, msg string) {
+	w.WriteString(msg)
+	w.Flush()
 }
