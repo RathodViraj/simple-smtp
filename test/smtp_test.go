@@ -52,7 +52,7 @@ func cleanAll(t *testing.T, rdb *redis.Client, username string) {
 		"lock:user:"+username,
 		"auth:user:"+username, // rate limiter per-user bucket
 		"auth:ip:127.0.0.1",   // rate limiter per-IP bucket (IPv4 loopback)
-		"auth:ip:::1",          // rate limiter per-IP bucket (IPv6 loopback)
+		"auth:ip:::1",         // rate limiter per-IP bucket (IPv6 loopback)
 	)
 }
 
