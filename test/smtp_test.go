@@ -51,7 +51,8 @@ func cleanAll(t *testing.T, rdb *redis.Client, username string) {
 		"auth:fail:user:"+username,
 		"lock:user:"+username,
 		"auth:user:"+username, // rate limiter per-user bucket
-		"auth:ip:127.0.0.1",   // rate limiter per-IP bucket (shared by all tests)
+		"auth:ip:127.0.0.1",   // rate limiter per-IP bucket (IPv4 loopback)
+		"auth:ip:::1",          // rate limiter per-IP bucket (IPv6 loopback)
 	)
 }
 
@@ -113,17 +114,20 @@ func b64(s string) string {
 	return base64.StdEncoding.EncodeToString([]byte(s))
 }
 
-// smtpLogin reads the greeting, sends AUTH LOGIN, and returns the final
-// response (235 on success, 535/454 on failure).
-// The server sends ONE 334 prompt then reads username+password back-to-back.
+// smtpLogin reads the greeting, sends AUTH LOGIN, handles the two-step
+// 334 prompt flow, and returns the final response (235/535/454).
 func smtpLogin(t *testing.T, r *bufio.Reader, w *bufio.Writer, username, password string) string {
 	t.Helper()
 	readLine(t, r) // 220 greeting
 	send(t, w, "AUTH LOGIN")
 	assertCode(t, readLine(t, r), "334") // username prompt
 	send(t, w, b64(username))
+	resp := readLine(t, r) // 334 password prompt, or 454/535 if rate-limited/locked
+	if !strings.HasPrefix(resp, "334") {
+		return resp // 454 or 535
+	}
 	send(t, w, b64(password))
-	return readLine(t, r) // 235 or 535 or 454
+	return readLine(t, r) // 235 or 535
 }
 
 // fullLogin dials, authenticates, sends HELO, and returns the open connection
@@ -133,8 +137,9 @@ func fullLogin(t *testing.T, username, password string) (net.Conn, *bufio.Reader
 	conn, r, w := smtpDial(t)
 	readLine(t, r) // 220 greeting
 	send(t, w, "AUTH LOGIN")
-	assertCode(t, readLine(t, r), "334")
+	assertCode(t, readLine(t, r), "334") // username prompt
 	send(t, w, b64(username))
+	assertCode(t, readLine(t, r), "334") // password prompt
 	send(t, w, b64(password))
 	assertCode(t, readLine(t, r), "235")
 	send(t, w, "HELO localhost")
@@ -284,6 +289,9 @@ func TestAuth_AccountLockAfterFailures(t *testing.T) {
 		conn.Close()
 	}
 
+	// Clean rate-limiter counters so the lock check is reached.
+	rdb.Del(context.Background(), "auth:user:"+testUsername, "auth:ip:127.0.0.1", "auth:ip:::1")
+
 	// Next attempt: server detects lock after username is submitted.
 	conn, r, w := smtpDial(t)
 	defer conn.Close()
@@ -366,8 +374,9 @@ func TestSMTP_HeloBeforeMailFrom(t *testing.T) {
 
 	// Auth OK but skip HELO — go straight to MAIL FROM.
 	send(t, w, "AUTH LOGIN")
-	assertCode(t, readLine(t, r), "334")
+	assertCode(t, readLine(t, r), "334") // username prompt
 	send(t, w, b64(testUsername))
+	assertCode(t, readLine(t, r), "334") // password prompt
 	send(t, w, b64(testPassword))
 	assertCode(t, readLine(t, r), "235")
 
