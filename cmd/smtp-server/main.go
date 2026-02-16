@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"smtp-server/db"
 	"smtp-server/middleware"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,10 +28,14 @@ var (
 	LocalDomains = map[string]bool{
 		"myserver.local": true, // placeholder
 	}
-	rdb *redis.Client
+	rdb       *redis.Client
+	tlsConfig *tls.Config
 )
 
-const startEpochInMilli = 1767225600000
+const (
+	startEpochInMilli = 1767225600000
+	MaxMessageSize    = 10 * 1024 * 1024
+)
 
 type SessionState int
 
@@ -49,6 +55,8 @@ type SMTPSession struct {
 	rcptTo        []string
 	data          string
 	authenticated bool
+	expectedSize  int
+	currentSize   int
 }
 
 func main() {
@@ -67,6 +75,15 @@ func main() {
 
 	rl = middleware.NewRateLimit(rdb, 20, 5, 5*time.Minute)
 	auth = middleware.SetupAuth(rdb, 5, 10*time.Second)
+
+	cert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
+	if err != nil {
+		log.Fatal("Failed to load TLS cert:", err)
+	}
+
+	tlsConfig = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	}
 
 	lis, err := net.Listen("tcp", ":8000")
 	if err != nil {
@@ -125,198 +142,268 @@ func handleConnection(conn net.Conn) {
 		line = strings.TrimSpace(line)
 		log.Println(line)
 
-		switch {
-		case strings.HasPrefix(line, "AUTH LOGIN"):
-			host, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-			ip := net.ParseIP(host)
+		quit := handleCommand(session, line, reader, writer)
 
-			writeAndFlush(writer, "334 VXNlcm5hbWU6\r\n")
+		// Pipelining: batch responses — flush only when no more buffered input.
+		if quit || reader.Buffered() == 0 {
+			writer.Flush()
+		}
 
-			userLine, _ := reader.ReadString('\n')
-			userNameBytes, _ := base64.StdEncoding.DecodeString(strings.TrimSpace(userLine))
-			username := string(userNameBytes)
-
-			if !rl.Validate(username, net.IP(ip)) {
-				writeAndFlush(writer, "454 Too many login attempts\r\n")
-				continue
-			}
-			if auth.CheckLock(username) {
-				writeAndFlush(writer, "535 Account temporarily locked\r\n")
-				continue
-			}
-
-			writeAndFlush(writer, "334 UGFzc3dvcmQ6\r\n")
-
-			passLine, _ := reader.ReadString('\n')
-
-			passwordBytes, _ := base64.StdEncoding.DecodeString(strings.TrimSpace(passLine))
-			password := string(passwordBytes)
-
-			dbHashPass, err := rdb.HGet(
-				context.Background(),
-				"user:"+username,
-				"password",
-			).Result()
-
-			if err == redis.Nil {
-				auth.IncreaseFails(username)
-				writeAndFlush(writer, "535 Authentication failed\r\n")
-				continue
-			}
-			if err != nil {
-				writeAndFlush(writer, "451 Local error\r\n")
-				continue
-			}
-
-			err = bcrypt.CompareHashAndPassword(
-				[]byte(dbHashPass),
-				[]byte(password),
-			)
-			if err != nil {
-				auth.IncreaseFails(username)
-				writeAndFlush(writer, "535 Authentication failed\r\n")
-			} else {
-				session.authenticated = true
-				session.state = StateInit
-				session.userName = username
-				rdb.Del(context.Background(), fmt.Sprintf("auth:fail:user:%s", username))
-				writeAndFlush(writer, "235 Authentication successful\r\n")
-			}
-
-		case strings.HasPrefix(line, "HELO"):
-			if !session.validateSession(StateInit, writer) {
-				continue
-			}
-			session.state = StateHelo
-			writeAndFlush(writer, "250 Hello\r\n")
-
-		case strings.HasPrefix(line, "MAIL FROM:"):
-			if !session.validateSession(StateHelo, writer) {
-				continue
-			}
-
-			dbUserEmail, err := rdb.HGet(
-				context.Background(),
-				"user:"+session.userName,
-				"email",
-			).Result()
-			if err == redis.Nil || session.userName == "" {
-				writeAndFlush(writer, "535 Authentication failed\r\n")
-				continue
-			}
-			if err != nil {
-				writeAndFlush(writer, "451 Local error\r\n")
-				continue
-			}
-			addr := strings.TrimSpace(line[len("MAIL FROM:"):])
-			addr = strings.Trim(addr, "<>")
-			if dbUserEmail != addr {
-				writeAndFlush(writer, "535 Authentication failed\r\n")
-				continue
-			}
-
-			session.state = StateMail
-			session.mailFrom = line
-			writeAndFlush(writer, "250 OK\r\n")
-
-		case strings.HasPrefix(line, "RCPT TO:"):
-			if session.state != StateMail && session.state != StateRcpt {
-				if !session.authenticated {
-					writeAndFlush(writer, "530 Authentication required\r\n")
-				} else {
-					writeAndFlush(writer, "503 Bad sequence of commands\r\n")
-				}
-				continue
-			}
-			session.state = StateRcpt
-			session.rcptTo = append(session.rcptTo, line)
-			writeAndFlush(writer, "250 OK\r\n")
-
-		case line == "DATA":
-			if !session.validateSession(StateRcpt, writer) {
-				continue
-			}
-			session.state = StateData
-
-			writeAndFlush(writer, "354 End data with <CR><LF>.<CR><LF>\r\n")
-
-			var body strings.Builder
-			for {
-				dl, _ := reader.ReadString('\n')
-				dl = strings.TrimSpace(dl)
-
-				if dl == "." {
-					break
-				}
-				body.WriteString(dl + "\n")
-			}
-			session.data = body.String()
-
-			fmt.Println("MAIL:", session.mailFrom)
-			fmt.Println("RCPT:", session.rcptTo)
-			fmt.Println("DATA:", session.data)
-
-			id, err := IDGen.NextID()
-			if err != nil {
-				log.Println(err)
-				writeAndFlush(writer, "451 Local error in processing\r\n")
-				continue
-			}
-
-			host, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-
-			rcptJSON, _ := json.Marshal(session.rcptTo)
-
-			msg := map[string]any{
-				"id":       id,
-				"username": session.userName,
-				"from":     session.mailFrom,
-				"to":       string(rcptJSON),
-				"data":     session.data,
-				"time":     time.Now().Unix(),
-				"retry":    0,
-				"clientIP": host,
-			}
-
-			msgJSON, err := json.Marshal(msg)
-			if err != nil {
-				writeAndFlush(writer, "451 Local error in processing\r\n")
-				continue
-			}
-
-			err = rdb.LPush(context.Background(), "mail_queue", msgJSON).Err()
-			if err != nil {
-				writeAndFlush(writer, "451 Queue error\r\n")
-				continue
-			}
-
-			writeAndFlush(writer, "250 Message accepted\r\n")
-
-			session.Reset()
-
-		case line == "RSET":
-			session.Reset()
-			writeAndFlush(writer, "250 OK\r\n")
-			continue
-
-		case line == "QUIT":
-			writeAndFlush(writer, "221 Bye\r\n")
+		if quit {
 			return
-
-		default:
-			writeAndFlush(writer, "500 Syntax error, command unrecognized\r\n")
 		}
 	}
 }
 
+func handleCommand(session *SMTPSession, line string, reader *bufio.Reader, writer *bufio.Writer) (quit bool) {
+	switch {
+	case strings.HasPrefix(line, "STARTTLS"):
+		writeAndFlush(writer, "220 Ready to start TLS\r\n")
+
+		tlsConn := tls.Server(session.conn, tlsConfig)
+		if err := tlsConn.Handshake(); err != nil {
+			log.Println("TLS handshake failed:", err)
+			return true
+		}
+
+		session.conn = tlsConn
+		reader = bufio.NewReader(tlsConn)
+		writer = bufio.NewWriter(tlsConn)
+		session.state = StateInit
+		session.authenticated = false
+
+	case strings.HasPrefix(line, "AUTH LOGIN"):
+		host, _, _ := net.SplitHostPort(session.conn.RemoteAddr().String())
+		ip := net.ParseIP(host)
+
+		writeAndFlush(writer, "334 VXNlcm5hbWU6\r\n")
+
+		userLine, _ := reader.ReadString('\n')
+		userNameBytes, _ := base64.StdEncoding.DecodeString(strings.TrimSpace(userLine))
+		username := string(userNameBytes)
+
+		if !rl.Validate(username, net.IP(ip)) {
+			writer.WriteString("454 Too many login attempts\r\n")
+			return false
+		}
+		if auth.CheckLock(username) {
+			writer.WriteString("535 Account temporarily locked\r\n")
+			return false
+		}
+
+		writeAndFlush(writer, "334 UGFzc3dvcmQ6\r\n")
+
+		passLine, _ := reader.ReadString('\n')
+
+		passwordBytes, _ := base64.StdEncoding.DecodeString(strings.TrimSpace(passLine))
+		password := string(passwordBytes)
+
+		dbHashPass, err := rdb.HGet(
+			context.Background(),
+			"user:"+username,
+			"password",
+		).Result()
+
+		if err == redis.Nil {
+			auth.IncreaseFails(username)
+			writer.WriteString("535 Authentication failed\r\n")
+			return false
+		}
+		if err != nil {
+			writer.WriteString("451 Local error\r\n")
+			return false
+		}
+
+		err = bcrypt.CompareHashAndPassword(
+			[]byte(dbHashPass),
+			[]byte(password),
+		)
+		if err != nil {
+			auth.IncreaseFails(username)
+			writer.WriteString("535 Authentication failed\r\n")
+		} else {
+			session.authenticated = true
+			session.state = StateInit
+			session.userName = username
+			rdb.Del(context.Background(), fmt.Sprintf("auth:fail:user:%s", username))
+			writer.WriteString("235 Authentication successful\r\n")
+		}
+
+	case strings.HasPrefix(line, "EHLO"):
+		session.state = StateHelo
+		writer.WriteString("250-smtp.yourserver.local\r\n")
+		writer.WriteString("250-AUTH LOGIN\r\n")
+		writer.WriteString("250-SIZE 10485760\r\n")
+		writer.WriteString("250-PIPELINING\r\n")
+		writer.WriteString("250 STARTTLS\r\n")
+
+	case strings.HasPrefix(line, "HELO"):
+		if !session.validateSession(StateInit, writer) {
+			return false
+		}
+		session.state = StateHelo
+		writer.WriteString("250 Hello\r\n")
+
+	case strings.HasPrefix(line, "MAIL FROM:"):
+		if !session.validateSession(StateHelo, writer) {
+			return false
+		}
+
+		dbUserEmail, err := rdb.HGet(
+			context.Background(),
+			"user:"+session.userName,
+			"email",
+		).Result()
+		if err == redis.Nil || session.userName == "" {
+			writer.WriteString("535 Authentication failed\r\n")
+			return false
+		}
+		if err != nil {
+			writer.WriteString("451 Local error\r\n")
+			return false
+		}
+
+		size := 0
+		if strings.Contains(line, "SIZE=") {
+			parts := strings.Split(line, "SIZE=")
+			if len(parts) > 1 {
+				s := strings.TrimSpace(parts[1])
+				parsed, _ := strconv.Atoi(s)
+				size = parsed
+			}
+		}
+
+		if size > MaxMessageSize {
+			writer.WriteString("552 Message size exceeds fixed limit\r\n")
+			return false
+		}
+
+		addr := strings.TrimSpace(line[len("MAIL FROM:"):])
+		addr = strings.Trim(addr, "<>")
+		if dbUserEmail != addr {
+			writer.WriteString("535 Authentication failed\r\n")
+			return false
+		}
+
+		session.state = StateMail
+		session.mailFrom = line
+		writer.WriteString("250 OK\r\n")
+
+	case strings.HasPrefix(line, "RCPT TO:"):
+		if session.state != StateMail && session.state != StateRcpt {
+			if !session.authenticated {
+				writer.WriteString("530 Authentication required\r\n")
+			} else {
+				writer.WriteString("503 Bad sequence of commands\r\n")
+			}
+			return false
+		}
+		session.state = StateRcpt
+		session.rcptTo = append(session.rcptTo, line)
+		writer.WriteString("250 OK\r\n")
+
+	case line == "DATA":
+		if !session.validateSession(StateRcpt, writer) {
+			return false
+		}
+		session.state = StateData
+
+		// Flush all pending pipelined responses + 354 prompt before reading body.
+		writer.WriteString("354 End data with <CR><LF>.<CR><LF>\r\n")
+		writer.Flush()
+
+		session.currentSize = 0
+		overflow := false
+		var body strings.Builder
+		for {
+			dl, _ := reader.ReadString('\n')
+			dl = strings.TrimSpace(dl)
+
+			if dl == "." {
+				break
+			}
+
+			session.currentSize += len(dl)
+
+			if session.currentSize > MaxMessageSize {
+				overflow = true
+				continue // drain remaining input until "."
+			}
+
+			body.WriteString(dl + "\n")
+		}
+
+		if overflow {
+			writer.WriteString("552 Message size exceeds fixed limit\r\n")
+			session.Reset()
+			return false
+		}
+
+		session.data = body.String()
+
+		fmt.Println("MAIL:", session.mailFrom)
+		fmt.Println("RCPT:", session.rcptTo)
+		fmt.Println("DATA:", session.data)
+
+		id, err := IDGen.NextID()
+		if err != nil {
+			log.Println(err)
+			writer.WriteString("451 Local error in processing\r\n")
+			return false
+		}
+
+		host, _, _ := net.SplitHostPort(session.conn.RemoteAddr().String())
+
+		rcptJSON, _ := json.Marshal(session.rcptTo)
+
+		msg := map[string]any{
+			"id":       id,
+			"username": session.userName,
+			"from":     session.mailFrom,
+			"to":       string(rcptJSON),
+			"data":     session.data,
+			"time":     time.Now().Unix(),
+			"retry":    0,
+			"clientIP": host,
+		}
+
+		msgJSON, err := json.Marshal(msg)
+		if err != nil {
+			writer.WriteString("451 Local error in processing\r\n")
+			return false
+		}
+
+		err = rdb.LPush(context.Background(), "mail_queue", msgJSON).Err()
+		if err != nil {
+			writer.WriteString("451 Queue error\r\n")
+			return false
+		}
+
+		writer.WriteString("250 Message accepted\r\n")
+		session.Reset()
+
+	case line == "RSET":
+		session.Reset()
+		writer.WriteString("250 OK\r\n")
+
+	case line == "QUIT":
+		writer.WriteString("221 Bye\r\n")
+		return true
+
+	default:
+		writer.WriteString("500 Syntax error, command unrecognized\r\n")
+	}
+	return false
+}
+
 func (s *SMTPSession) validateSession(valid SessionState, w *bufio.Writer) bool {
 	if !s.authenticated {
-		writeAndFlush(w, "530 Authentication required\r\n")
+		w.WriteString("530 Authentication required\r\n")
 		return false
 	}
 
 	if s.state != valid {
-		writeAndFlush(w, "503 Bad sequence of commands\r\n")
+		w.WriteString("503 Bad sequence of commands\r\n")
 		return false
 	}
 
@@ -327,6 +414,8 @@ func (s *SMTPSession) Reset() {
 	s.mailFrom = ""
 	s.rcptTo = nil
 	s.data = ""
+	s.expectedSize = 0
+	s.currentSize = 0
 	s.state = StateHelo
 }
 
