@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -23,8 +22,8 @@ type User struct {
 }
 
 func createUserHandler(w http.ResponseWriter, r *http.Request) {
-	ctx, cancle := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancle()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
 	var u User
 	if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
@@ -44,14 +43,8 @@ func createUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if exists == 1 {
-		http.Error(w, "username exits", http.StatusBadRequest)
+		http.Error(w, "username exists", http.StatusBadRequest)
 		return
-	}
-
-	if exists == 1 {
-		fmt.Println("Key exists")
-	} else {
-		fmt.Println("Key does not exist")
 	}
 
 	hashedPassword, err := bcrypt.GenerateFromPassword(

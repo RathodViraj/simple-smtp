@@ -46,7 +46,7 @@ type SMTPSession struct {
 	state         SessionState
 	userName      string
 	mailFrom      string
-	rcpt          string
+	rcptTo        []string
 	data          string
 	authenticated bool
 }
@@ -78,6 +78,14 @@ func main() {
 
 	go SaveMailWorker()
 
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			schedulerWorker()
+		}
+	}()
+
 	for {
 		conn, err := lis.Accept()
 		if err != nil {
@@ -100,11 +108,17 @@ func handleConnection(conn net.Conn) {
 
 	writeAndFlush(writer, "220 SimpleSMTP ready\r\n")
 
+	const idleTimeout = 5 * time.Minute
+
 	for {
+		conn.SetReadDeadline(time.Now().Add(idleTimeout))
 		line, err := reader.ReadString('\n')
 		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				writeAndFlush(writer, "421 Idle timeout, closing connection\r\n")
+				return
+			}
 			log.Println(err)
-			conn.Write([]byte("451 server error"))
 			return
 		}
 
@@ -206,11 +220,16 @@ func handleConnection(conn net.Conn) {
 			writeAndFlush(writer, "250 OK\r\n")
 
 		case strings.HasPrefix(line, "RCPT TO:"):
-			if !session.validateSession(StateMail, writer) {
+			if session.state != StateMail && session.state != StateRcpt {
+				if !session.authenticated {
+					writeAndFlush(writer, "530 Authentication required\r\n")
+				} else {
+					writeAndFlush(writer, "503 Bad sequence of commands\r\n")
+				}
 				continue
 			}
 			session.state = StateRcpt
-			session.rcpt = line
+			session.rcptTo = append(session.rcptTo, line)
 			writeAndFlush(writer, "250 OK\r\n")
 
 		case line == "DATA":
@@ -234,7 +253,7 @@ func handleConnection(conn net.Conn) {
 			session.data = body.String()
 
 			fmt.Println("MAIL:", session.mailFrom)
-			fmt.Println("RCPT:", session.rcpt)
+			fmt.Println("RCPT:", session.rcptTo)
 			fmt.Println("DATA:", session.data)
 
 			id, err := IDGen.NextID()
@@ -244,14 +263,19 @@ func handleConnection(conn net.Conn) {
 				continue
 			}
 
+			host, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+
+			rcptJSON, _ := json.Marshal(session.rcptTo)
+
 			msg := map[string]any{
 				"id":       id,
 				"username": session.userName,
 				"from":     session.mailFrom,
-				"to":       session.rcpt,
+				"to":       string(rcptJSON),
 				"data":     session.data,
 				"time":     time.Now().Unix(),
 				"retry":    0,
+				"clientIP": host,
 			}
 
 			msgJSON, err := json.Marshal(msg)
@@ -301,7 +325,7 @@ func (s *SMTPSession) validateSession(valid SessionState, w *bufio.Writer) bool 
 
 func (s *SMTPSession) Reset() {
 	s.mailFrom = ""
-	s.rcpt = ""
+	s.rcptTo = nil
 	s.data = ""
 	s.state = StateHelo
 }
@@ -343,31 +367,68 @@ func SaveMailWorker() {
 			continue
 		}
 
-		to := msg["to"].(string)
-		domain := getDomain(to)
+		// Parse recipients list (stored as JSON array).
+		var recipients []string
+		if err := json.Unmarshal([]byte(msg["to"].(string)), &recipients); err != nil {
+			log.Println("Error parsing recipients:", err)
+			continue
+		}
 
-		if LocalDomains[domain] {
-			err := rdb.HSet(
-				context.Background(),
-				fmt.Sprintf("mailbox:%s:%s", msg["username"], msg["id"]),
-				msg,
-			).Err()
-			if err != nil {
-				go AddToRetry(msg, err, 3)
-				continue
-			}
-		} else {
-			mxHost, err := lookupMX(domain)
-			if err != nil {
-				go AddToRetry(msg, err, 2)
-				continue
-			}
+		clientIP, _ := msg["clientIP"].(string)
+		received := buildReceivedHeader("smtp.yourserver.local", clientIP)
 
-			log.Println("Message saved successfully:", msg["id"])
-			err = SendSMTP(mxHost+":25", msg["from"].(string), msg["to"].(string), msg["data"].(string))
-			if err != nil {
-				go AddToRetry(msg, err, 3)
-				continue
+		for _, rawRcpt := range recipients {
+			to := strings.TrimPrefix(rawRcpt, "RCPT TO:")
+			to = strings.TrimSpace(to)
+			to = strings.Trim(to, "<>")
+			domain := getDomain(to)
+
+			if LocalDomains[domain] {
+				localMsg := copyMap(msg)
+				localMsg["data"] = received + msg["data"].(string)
+				localMsg["to"] = to
+				err := rdb.HSet(
+					context.Background(),
+					fmt.Sprintf("mailbox:%s:%s", msg["username"], msg["id"]),
+					localMsg,
+				).Err()
+				if err != nil {
+					go AddToRetry(localMsg, err)
+					continue
+				}
+			} else {
+				mxHost, err := lookupMX(domain)
+				if err != nil {
+					errMsg := copyMap(msg)
+					errMsg["to"] = to
+					go AddToRetry(errMsg, err)
+					continue
+				}
+
+				fromDomain := getDomain(msg["from"].(string))
+				id := int64(msg["id"].(float64))
+				headers := fmt.Sprintf(
+					"From: %s\r\n"+
+						"To: %s\r\n"+
+						"Subject: %s\r\n"+
+						"Date: %s\r\n"+
+						"Message-ID: %s\r\n"+
+						"\r\n",
+
+					msg["from"].(string),
+					to,
+					"New message",
+					time.Unix(int64(msg["time"].(float64)), 0).Format(time.RFC1123Z),
+					fmt.Sprintf("<%d@%s>", id, fromDomain),
+				)
+				fullBody := received + headers + msg["data"].(string)
+				err = SendSMTP(mxHost+":25", msg["from"].(string), to, fullBody)
+				if err != nil {
+					errMsg := copyMap(msg)
+					errMsg["to"] = to
+					go AddToRetry(errMsg, err)
+					continue
+				}
 			}
 		}
 
@@ -384,12 +445,14 @@ func SaveMailWorker() {
 			},
 		).Err()
 		if err != nil {
-			go AddToRetry(msg, err, 1)
+			go AddToRetry(msg, err)
+			continue
 		}
+		log.Println("Message saved successfully:", msg["id"])
 	}
 }
 
-func AddToRetry(msg map[string]any, err error, nextAttempt int) {
+func AddToRetry(msg map[string]any, err error) {
 	msg["error"] = err.Error()
 	tries := 0
 	if r, ok := msg["retry"].(float64); ok {
@@ -397,12 +460,40 @@ func AddToRetry(msg map[string]any, err error, nextAttempt int) {
 	}
 	tries++
 	if tries > 5 {
-		log.Printf("Droping mail. Last error: %s", err.Error())
+		// Only generate a bounce if the original sender is not mailer-daemon
+		// to prevent infinite bounce loops.
+		from, _ := msg["from"].(string)
+		if !strings.HasPrefix(from, "mailer-daemon@") {
+			bounceBody := fmt.Sprintf(
+				"Subject: Mail delivery failed\r\n\r\n"+
+					"Your message to %s could not be delivered.\r\n\r\n"+
+					"Error:\r\n%s\r\n",
+				msg["to"],
+				msg["error"],
+			)
+			newID, _ := IDGen.NextID()
+			bounceMsg := map[string]any{
+				"id":       newID,
+				"from":     "mailer-daemon@yourserver.local",
+				"to":       fmt.Sprintf("[\"RCPT TO:<%s>\"]", from),
+				"data":     bounceBody,
+				"retry":    0,
+				"username": "system",
+				"clientIP": "127.0.0.1",
+				"time":     time.Now().Unix(),
+			}
+
+			jsonMsg, _ := json.Marshal(bounceMsg)
+			rdb.LPush(context.Background(), "mail_queue", jsonMsg)
+		}
+
+		log.Printf("Dropping mail. Last error: %s", err.Error())
 		msgJSON, _ := json.Marshal(msg)
 		rdb.RPush(context.Background(), "failed_mail_queue", msgJSON)
 		return
 	}
 	msg["retry"] = tries
+	nextAttempt := time.Now().Add(time.Duration(1<<tries) * time.Minute).Unix()
 	msgJSON, _ := json.Marshal(msg)
 	rdb.ZAdd(context.Background(), "mail_retry_queue", redis.Z{
 		Score:  float64(nextAttempt),
@@ -425,7 +516,27 @@ func schedulerWorker() {
 	}
 }
 
+func copyMap(src map[string]any) map[string]any {
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
 func writeAndFlush(w *bufio.Writer, msg string) {
 	w.WriteString(msg)
 	w.Flush()
+}
+
+func buildReceivedHeader(serverHost, clientIP string) string {
+	return fmt.Sprintf(
+		"Received: from %s (%s) \r\n"+
+			"	by %s with SimpleSMTP\r\n"+
+			"	%s\r\n",
+		serverHost,
+		clientIP,
+		serverHost,
+		time.Now().Format(time.RFC1123Z),
+	)
 }
