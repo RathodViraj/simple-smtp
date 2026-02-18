@@ -147,6 +147,42 @@ func fullLogin(t *testing.T, username, password string) (net.Conn, *bufio.Reader
 	return conn, r, w
 }
 
+// readMultiLine reads a multi-line SMTP response (e.g., EHLO reply)
+// and returns all lines. A multi-line response ends when the 4th
+// character of a line is a space instead of a dash (e.g., "250 STARTTLS").
+func readMultiLine(t *testing.T, r *bufio.Reader) []string {
+	t.Helper()
+	var lines []string
+	for {
+		line := readLine(t, r)
+		lines = append(lines, line)
+		if len(line) >= 4 && line[3] == ' ' {
+			break
+		}
+	}
+	return lines
+}
+
+// fullLoginEHLO is like fullLogin but uses EHLO instead of HELO.
+// Flow: EHLO → AUTH LOGIN → EHLO (re-issue after auth resets state).
+func fullLoginEHLO(t *testing.T, username, password string) (net.Conn, *bufio.Reader, *bufio.Writer) {
+	t.Helper()
+	conn, r, w := smtpDial(t)
+	readLine(t, r) // 220 greeting
+	send(t, w, "EHLO localhost")
+	readMultiLine(t, r)
+	send(t, w, "AUTH LOGIN")
+	assertCode(t, readLine(t, r), "334")
+	send(t, w, b64(username))
+	assertCode(t, readLine(t, r), "334")
+	send(t, w, b64(password))
+	assertCode(t, readLine(t, r), "235")
+	// AUTH LOGIN sets state to StateInit; re-issue EHLO to reach StateHelo.
+	send(t, w, "EHLO localhost")
+	readMultiLine(t, r)
+	return conn, r, w
+}
+
 // ─────────────────────────────────────────────
 // HTTP /create-user
 // ─────────────────────────────────────────────
@@ -555,8 +591,175 @@ func TestSMTP_UnknownCommand(t *testing.T) {
 	defer conn.Close()
 	readLine(t, r) // 220
 	send(t, w, "GARBAGE COMMAND")
-	resp := readLine(t, r)
-	if !strings.HasPrefix(resp, "500") && !strings.HasPrefix(resp, "250") {
-		t.Errorf("expected 500 (or 250 if not yet fixed) for unknown command, got: %q", resp)
+	assertCode(t, readLine(t, r), "500")
+}
+
+// ─────────────────────────────────────────────
+// EHLO
+// ─────────────────────────────────────────────
+
+func TestSMTP_EhloCapabilities(t *testing.T) {
+	conn, r, w := smtpDial(t)
+	defer conn.Close()
+	readLine(t, r) // 220
+
+	send(t, w, "EHLO localhost")
+	lines := readMultiLine(t, r)
+	joined := strings.Join(lines, " ")
+	for _, kw := range []string{"AUTH LOGIN", "SIZE", "PIPELINING", "STARTTLS"} {
+		if !strings.Contains(joined, kw) {
+			t.Errorf("EHLO response missing %q, got: %v", kw, lines)
+		}
 	}
+}
+
+func TestSMTP_EhloWorksWithoutAuth(t *testing.T) {
+	conn, r, w := smtpDial(t)
+	defer conn.Close()
+	readLine(t, r) // 220
+
+	send(t, w, "EHLO localhost")
+	lines := readMultiLine(t, r)
+	// EHLO should succeed (250) without authentication.
+	assertCode(t, lines[0], "250")
+}
+
+func TestSMTP_EhloThenFullFlow(t *testing.T) {
+	rdb := redisClient()
+	cleanAll(t, rdb, testUsername)
+	defer cleanAll(t, rdb, testUsername)
+	createUser(t, testUsername, testPassword, testEmail)
+
+	conn, r, w := fullLoginEHLO(t, testUsername, testPassword)
+	defer conn.Close()
+
+	send(t, w, fmt.Sprintf("MAIL FROM:<%s>", testEmail))
+	assertCode(t, readLine(t, r), "250")
+
+	send(t, w, fmt.Sprintf("RCPT TO:<%s>", testEmail2))
+	assertCode(t, readLine(t, r), "250")
+
+	send(t, w, "DATA")
+	assertCode(t, readLine(t, r), "354")
+
+	send(t, w, "Subject: EHLO Test")
+	send(t, w, "Hello via EHLO!")
+	send(t, w, ".")
+	assertCode(t, readLine(t, r), "250")
+}
+
+// ─────────────────────────────────────────────
+// Multiple RCPT TO
+// ─────────────────────────────────────────────
+
+func TestSMTP_MultipleRcptTo(t *testing.T) {
+	rdb := redisClient()
+	cleanAll(t, rdb, testUsername)
+	defer cleanAll(t, rdb, testUsername)
+	createUser(t, testUsername, testPassword, testEmail)
+
+	conn, r, w := fullLogin(t, testUsername, testPassword)
+	defer conn.Close()
+
+	send(t, w, fmt.Sprintf("MAIL FROM:<%s>", testEmail))
+	assertCode(t, readLine(t, r), "250")
+
+	// Multiple RCPT TO recipients — all should be accepted.
+	recipients := []string{
+		"alice@example.com",
+		"bob@example.com",
+		"charlie@example.com",
+	}
+	for _, rcpt := range recipients {
+		send(t, w, fmt.Sprintf("RCPT TO:<%s>", rcpt))
+		assertCode(t, readLine(t, r), "250")
+	}
+
+	send(t, w, "DATA")
+	assertCode(t, readLine(t, r), "354")
+
+	send(t, w, "Subject: Multi-recipient")
+	send(t, w, "Hello all!")
+	send(t, w, ".")
+	assertCode(t, readLine(t, r), "250")
+}
+
+// ─────────────────────────────────────────────
+// Pipelining
+// ─────────────────────────────────────────────
+
+func TestSMTP_Pipelining(t *testing.T) {
+	rdb := redisClient()
+	cleanAll(t, rdb, testUsername)
+	defer cleanAll(t, rdb, testUsername)
+	createUser(t, testUsername, testPassword, testEmail)
+
+	conn, r, w := fullLogin(t, testUsername, testPassword)
+	defer conn.Close()
+
+	// Pipeline MAIL FROM + RCPT TO in a single batch (no flush between).
+	fmt.Fprintf(w, "MAIL FROM:<%s>\r\n", testEmail)
+	fmt.Fprintf(w, "RCPT TO:<%s>\r\n", testEmail2)
+	w.Flush()
+
+	assertCode(t, readLine(t, r), "250") // MAIL FROM OK
+	assertCode(t, readLine(t, r), "250") // RCPT TO OK
+
+	send(t, w, "DATA")
+	assertCode(t, readLine(t, r), "354")
+
+	send(t, w, "Subject: Pipelined")
+	send(t, w, "Body.")
+	send(t, w, ".")
+	assertCode(t, readLine(t, r), "250")
+}
+
+func TestSMTP_PipeliningWithErrors(t *testing.T) {
+	rdb := redisClient()
+	cleanAll(t, rdb, testUsername)
+	defer cleanAll(t, rdb, testUsername)
+	createUser(t, testUsername, testPassword, testEmail)
+
+	conn, r, w := fullLogin(t, testUsername, testPassword)
+	defer conn.Close()
+
+	// Pipeline MAIL FROM (wrong email) + RCPT TO — both sent before reading.
+	fmt.Fprintf(w, "MAIL FROM:<imposter@evil.com>\r\n")
+	fmt.Fprintf(w, "RCPT TO:<%s>\r\n", testEmail2)
+	w.Flush()
+
+	assertCode(t, readLine(t, r), "535") // MAIL FROM rejected
+	assertCode(t, readLine(t, r), "503") // RCPT TO: bad sequence
+}
+
+// ─────────────────────────────────────────────
+// SIZE parameter
+// ─────────────────────────────────────────────
+
+func TestSMTP_MailFromOversizeReject(t *testing.T) {
+	rdb := redisClient()
+	cleanAll(t, rdb, testUsername)
+	defer cleanAll(t, rdb, testUsername)
+	createUser(t, testUsername, testPassword, testEmail)
+
+	conn, r, w := fullLogin(t, testUsername, testPassword)
+	defer conn.Close()
+
+	// SIZE exceeds 10 MB limit → 552.
+	send(t, w, fmt.Sprintf("MAIL FROM:<%s> SIZE=99999999", testEmail))
+	assertCode(t, readLine(t, r), "552")
+}
+
+// ─────────────────────────────────────────────
+// STARTTLS
+// ─────────────────────────────────────────────
+
+func TestSMTP_StarttlsResponse(t *testing.T) {
+	conn, r, w := smtpDial(t)
+	defer conn.Close()
+	readLine(t, r) // 220
+
+	send(t, w, "STARTTLS")
+	assertCode(t, readLine(t, r), "220")
+	// Server will attempt TLS handshake; we close without negotiating.
 }

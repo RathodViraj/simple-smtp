@@ -2,13 +2,18 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"smtp-server/db"
 	"smtp-server/middleware"
 	"sort"
@@ -16,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/emersion/go-msgauth/dkim"
 	"github.com/redis/go-redis/v9"
 	"github.com/sony/sonyflake/v2"
 	"golang.org/x/crypto/bcrypt"
@@ -28,13 +34,15 @@ var (
 	LocalDomains = map[string]bool{
 		"myserver.local": true, // placeholder
 	}
-	rdb       *redis.Client
-	tlsConfig *tls.Config
+	rdb        *redis.Client
+	tlsConfig  *tls.Config
+	privateKey []byte
 )
 
 const (
 	startEpochInMilli = 1767225600000
 	MaxMessageSize    = 10 * 1024 * 1024
+	idleTimeout       = 5 * time.Minute
 )
 
 type SessionState int
@@ -85,6 +93,11 @@ func main() {
 		Certificates: []tls.Certificate{cert},
 	}
 
+	privateKey, err = os.ReadFile("dkim_private.pem")
+	if err != nil {
+		log.Fatal("Failed to load DKIM private key:", err)
+	}
+
 	lis, err := net.Listen("tcp", ":8000")
 	if err != nil {
 		log.Fatal(err)
@@ -125,8 +138,6 @@ func handleConnection(conn net.Conn) {
 
 	writeAndFlush(writer, "220 SimpleSMTP ready\r\n")
 
-	const idleTimeout = 5 * time.Minute
-
 	for {
 		conn.SetReadDeadline(time.Now().Add(idleTimeout))
 		line, err := reader.ReadString('\n')
@@ -157,6 +168,15 @@ func handleConnection(conn net.Conn) {
 
 func handleCommand(session *SMTPSession, line string, reader *bufio.Reader, writer *bufio.Writer) (quit bool) {
 	switch {
+	case strings.HasPrefix(line, "EHLO"):
+		session.state = StateHelo
+		writer.WriteString("250-smtp.yourserver.local\r\n")
+		writer.WriteString("250-AUTH LOGIN\r\n")
+		writer.WriteString("250-SIZE 10485760\r\n")
+		writer.WriteString("250-PIPELINING\r\n")
+		writer.WriteString("250 STARTTLS\r\n")
+		writer.Flush()
+
 	case strings.HasPrefix(line, "STARTTLS"):
 		writeAndFlush(writer, "220 Ready to start TLS\r\n")
 
@@ -228,14 +248,6 @@ func handleCommand(session *SMTPSession, line string, reader *bufio.Reader, writ
 			rdb.Del(context.Background(), fmt.Sprintf("auth:fail:user:%s", username))
 			writer.WriteString("235 Authentication successful\r\n")
 		}
-
-	case strings.HasPrefix(line, "EHLO"):
-		session.state = StateHelo
-		writer.WriteString("250-smtp.yourserver.local\r\n")
-		writer.WriteString("250-AUTH LOGIN\r\n")
-		writer.WriteString("250-SIZE 10485760\r\n")
-		writer.WriteString("250-PIPELINING\r\n")
-		writer.WriteString("250 STARTTLS\r\n")
 
 	case strings.HasPrefix(line, "HELO"):
 		if !session.validateSession(StateInit, writer) {
@@ -396,6 +408,34 @@ func handleCommand(session *SMTPSession, line string, reader *bufio.Reader, writ
 	return false
 }
 
+func singnedDKIM(msg []byte) ([]byte, error) {
+	block, _ := pem.Decode(privateKey)
+	if block == nil {
+		return nil, fmt.Errorf("failed to parse PEM block containing the key")
+	}
+
+	parsedKey, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+
+	options := &dkim.SignOptions{
+		Domain:   "myserver.local",
+		Selector: "selector1",
+		Signer:   parsedKey.(crypto.Signer),
+		HeaderKeys: []string{
+			"from", "to", "subject", "date", "message-id",
+		},
+	}
+
+	var signed bytes.Buffer
+	if err := dkim.Sign(&signed, bytes.NewReader(msg), options); err != nil {
+		return nil, err
+	}
+
+	return signed.Bytes(), nil
+}
+
 func (s *SMTPSession) validateSession(valid SessionState, w *bufio.Writer) bool {
 	if !s.authenticated {
 		w.WriteString("530 Authentication required\r\n")
@@ -511,7 +551,15 @@ func SaveMailWorker() {
 					fmt.Sprintf("<%d@%s>", id, fromDomain),
 				)
 				fullBody := received + headers + msg["data"].(string)
-				err = SendSMTP(mxHost+":25", msg["from"].(string), to, fullBody)
+				signedBody, err := singnedDKIM([]byte(fullBody))
+				if err != nil {
+					errMsg := copyMap(msg)
+					errMsg["to"] = to
+					go AddToRetry(errMsg, err)
+					continue
+				}
+
+				err = SendSMTP(mxHost+":25", msg["from"].(string), to, string(signedBody))
 				if err != nil {
 					errMsg := copyMap(msg)
 					errMsg["to"] = to
